@@ -42,6 +42,7 @@ there, never by a guess about it.
 import hashlib
 import io
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -81,6 +82,16 @@ IGNORE_TOP_LEVEL = {"folder.ico", "sync.ffs_lock"}
 # passed through to iiSU as a placeholder, but the real file on disk is
 # untouched, the emulator still finds it right where it always was.
 NEVER_PLACEHOLDER_EXTENSIONS = {".sbi"}
+
+# Files that are part of an emulator/tool install or its data, never a game.
+# Console folders often double as an emulator's home (RPCS3 under ps3/, PCSX2
+# under ps2/, a Dolphin mod pack under wii/), so without this a single
+# install can add tens of thousands of bogus "games" and balloon the archive.
+NON_ROM_EXTENSIONS = {
+    ".dll", ".exe", ".ini", ".json", ".log", ".txt", ".yml", ".yaml", ".xml", ".cfg", ".conf",
+    ".pdb", ".lib", ".so", ".dylib", ".pak", ".dat", ".db", ".sqlite", ".png", ".jpg", ".jpeg",
+    ".ico", ".lnk", ".url", ".bat", ".cmd", ".sh", ".py", ".md", ".pdf", ".ffs_lock",
+}
 
 CUE_FILE_LINE = re.compile(r'^\s*FILE\s+"([^"]+)"', re.IGNORECASE)
 
@@ -202,8 +213,33 @@ def adb(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
+def load_excluded_roots() -> set[Path]:
+    """config.json's search_roots are where emulators live; any of them that
+    sit under the ROM folder must never be mirrored as games."""
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {Path(p) for p in config.get("search_roots", [])}
+
+
+def _is_emulator_install(directory: Path, filenames: list[str], excluded_roots: set[Path], shortname: str) -> bool:
+    """A subfolder that is a configured emulator root, or that holds an .exe
+    directly, is an emulator/tool install rather than a ROM folder. Windows
+    Apps keep their executables under the "windows" console on purpose."""
+    if directory in excluded_roots:
+        return True
+    if shortname == "windows":
+        return False
+    return any(name.lower().endswith(".exe") for name in filenames)
+
+
 def scan_library(
-    roms_dir: Path, exact: dict, by_compact: dict, dedupe_exceptions: set[str] | None = None
+    roms_dir: Path,
+    exact: dict,
+    by_compact: dict,
+    dedupe_exceptions: set[str] | None = None,
+    excluded_roots: set[Path] | None = None,
 ) -> tuple[dict[str, list[tuple[str, int, int]]], list[str]]:
     """Walks roms_dir once, grouping recognized console folders' files by
     iiSU short name with (relative path, size, mtime) for each, both
@@ -211,6 +247,8 @@ def scan_library(
     for change detection come from this one walk."""
     if dedupe_exceptions is None:
         dedupe_exceptions = load_dedupe_exceptions()
+    if excluded_roots is None:
+        excluded_roots = load_excluded_roots()
     consoles: dict[str, list[tuple[str, int, int]]] = {}
     skipped = []
     for console_folder in sorted(roms_dir.iterdir()):
@@ -223,10 +261,17 @@ def scan_library(
             continue
 
         by_directory: dict[Path, list[Path]] = {}
-        for file_path in console_folder.rglob("*"):
-            if file_path.is_dir():
+        for dirpath, dirnames, filenames in os.walk(console_folder):
+            current = Path(dirpath)
+            if current != console_folder and _is_emulator_install(current, filenames, excluded_roots, shortname):
+                dirnames.clear()
                 continue
-            by_directory.setdefault(file_path.parent, []).append(file_path)
+            dirnames[:] = [d for d in dirnames if (current / d) not in excluded_roots]
+            for name in filenames:
+                file_path = current / name
+                if file_path.suffix.lower() in NON_ROM_EXTENSIONS:
+                    continue
+                by_directory.setdefault(current, []).append(file_path)
 
         entries = []
         for directory, files in by_directory.items():
@@ -386,7 +431,7 @@ def main() -> None:
     adb("shell", f"rm -f {shlex.quote(AVD_TAR_PUSH_PATH)}", check=False)
     tar_path.unlink(missing_ok=True)
     if result.returncode != 0:
-        print("Extracting the archive on the AVD failed:")
+        print(f"Extracting the archive on the AVD failed (exit code {result.returncode}):")
         print(result.stdout)
         print(result.stderr)
         sys.exit(1)

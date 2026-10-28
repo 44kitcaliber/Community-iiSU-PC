@@ -158,6 +158,50 @@ class ScanLibraryDedupTests(unittest.TestCase):
             self.assertEqual(names, ["Normal.m3u", "gt2disc.bin"])
 
 
+class ScanLibraryEmulatorInstallTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.exact, cls.by_compact = load_console_lookup()
+
+    def _scan(self, roms_dir, excluded_roots=None):
+        return scan_library(roms_dir, self.exact, self.by_compact, dedupe_exceptions=set(), excluded_roots=excluded_roots or set())
+
+    def test_subfolder_with_an_exe_is_treated_as_an_emulator_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roms_dir = Path(tmp)
+            ps3 = roms_dir / "ps3"
+            (ps3 / "rpcs3" / "dev_flash").mkdir(parents=True)
+            (ps3 / "rpcs3" / "rpcs3.exe").write_bytes(b"x")
+            (ps3 / "rpcs3" / "dev_flash" / "vsh.self").write_bytes(b"x")
+            (ps3 / "Game.iso").write_bytes(b"x")
+
+            consoles, _skipped = self._scan(roms_dir)
+            self.assertEqual([rel for rel, _s, _m in consoles["ps3"]], ["Game.iso"])
+
+    def test_configured_emulator_root_is_skipped_even_without_an_exe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roms_dir = Path(tmp)
+            wii = roms_dir / "wii"
+            (wii / "Mods").mkdir(parents=True)
+            (wii / "Mods" / "asset.brres").write_bytes(b"x")
+            (wii / "Game.rvz").write_bytes(b"x")
+
+            consoles, _skipped = self._scan(roms_dir, excluded_roots={wii / "Mods"})
+            self.assertEqual([rel for rel, _s, _m in consoles["wii"]], ["Game.rvz"])
+
+    def test_non_rom_files_are_never_placeholders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roms_dir = Path(tmp)
+            gba = roms_dir / "gba"
+            gba.mkdir()
+            (gba / "Game.gba").write_bytes(b"x")
+            (gba / "notes.txt").write_bytes(b"x")
+            (gba / "folder.ini").write_bytes(b"x")
+
+            consoles, _skipped = self._scan(roms_dir)
+            self.assertEqual([rel for rel, _s, _m in consoles["gba"]], ["Game.gba"])
+
+
 class DedupeExceptionsPersistenceTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
